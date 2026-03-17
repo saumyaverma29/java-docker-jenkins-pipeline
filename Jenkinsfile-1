@@ -1,6 +1,14 @@
 pipeline {
   agent any
 
+  parameters {
+    booleanParam(
+      name: 'DOCKERHUB_LOGIN',
+      defaultValue: false,
+      description: 'Enable ONLY if the Docker Hub repo is private or you hit rate limits. Requires a valid Docker Hub access token in Jenkins credentials.'
+    )
+  }
+
   environment {
     // ---- Docker Hub image to pull/run ----
     DOCKERHUB_USER = "saumy123"
@@ -8,9 +16,16 @@ pipeline {
     IMAGE_TAG      = "latest"
     IMAGE_REF      = "docker.io/${DOCKERHUB_USER}/${IMAGE_REPO}:${IMAGE_TAG}"
 
-    // ---- Podman remote (your Windows -> WSL podman machine root connection) ----
+    // ---- Podman remote (Windows -> WSL podman machine root connection) ----
     PODMAN_HOST     = "ssh://root@127.0.0.1:64000/run/podman/podman.sock"
     PODMAN_IDENTITY = "C:\\Users\\saumyver\\.local\\share\\containers\\podman\\machine\\machine"
+
+    // ---- Jenkins credential ID containing Docker Hub username + ACCESS TOKEN ----
+    // Create/update this credential in Jenkins:
+    //   ID: dockerhub-creds-token
+    //   Username: saumy123
+    //   Password: <Docker Hub Access Token>
+    DOCKERHUB_CREDS_ID = "dockerhub-creds-token"
   }
 
   options { timestamps() }
@@ -27,37 +42,61 @@ pipeline {
       }
     }
 
-    /*
-      Login is ONLY needed if the Docker Hub repo is private OR you are rate-limited.
-      Your earlier builds failed due to invalid username/password, so this stage
-      is made OPTIONAL and controlled by a boolean parameter.
-    */
-    stage('Login to Docker Hub (optional)') {
-  when { expression { return params.DOCKERHUB_LOGIN } }
-  steps {
-    withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
-                                      usernameVariable: 'DH_USER',
-                                      passwordVariable: 'DH_PASS')]) {
-      powershell '''
-        $ErrorActionPreference = "Stop"
-
-        $env:CONTAINER_HOST   = $env:PODMAN_HOST
-        $env:CONTAINER_SSHKEY = $env:PODMAN_IDENTITY
-
-        # Send password/token via stdin safely
-        $env:DH_PASS | podman login docker.io -u $env:DH_USER --password-stdin
-      '''
+    stage('Credential sanity check (no secrets)') {
+      when { expression { return params.DOCKERHUB_LOGIN } }
+      steps {
+        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}",
+                                          usernameVariable: 'DH_USER',
+                                          passwordVariable: 'DH_PASS')]) {
+          powershell '''
+            $ErrorActionPreference = "Stop"
+            Write-Host "Docker Hub username from Jenkins credential: $env:DH_USER"
+            if ([string]::IsNullOrWhiteSpace($env:DH_PASS)) {
+              throw "Docker Hub token/password is EMPTY in Jenkins credentials."
+            }
+            Write-Host ("Token length (for sanity): " + $env:DH_PASS.Length)
+          '''
+        }
+      }
     }
-  }
-}
+
+    stage('Login to Docker Hub (optional, using authfile)') {
+      when { expression { return params.DOCKERHUB_LOGIN } }
+      steps {
+        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}",
+                                          usernameVariable: 'DH_USER',
+                                          passwordVariable: 'DH_PASS')]) {
+          powershell '''
+            $ErrorActionPreference = "Stop"
+
+            $env:CONTAINER_HOST   = $env:PODMAN_HOST
+            $env:CONTAINER_SSHKEY = $env:PODMAN_IDENTITY
+
+            $authFile = Join-Path $env:WORKSPACE ".podman-auth.json"
+
+            # Login using a dedicated auth file (avoids user/SYSTEM credential-store issues)
+            $env:DH_PASS | podman login docker.io -u $env:DH_USER --password-stdin --authfile $authFile
+
+            if (!(Test-Path $authFile)) { throw "Auth file was not created: $authFile" }
+          '''
+        }
+      }
+    }
 
     stage('Pull image') {
       steps {
         bat """
           set CONTAINER_HOST=%PODMAN_HOST%
           set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
+
           echo Pulling %IMAGE_REF%
-          podman pull %IMAGE_REF%
+
+          if "${params.DOCKERHUB_LOGIN}"=="true" (
+            podman pull --authfile "%WORKSPACE%\\.podman-auth.json" %IMAGE_REF%
+          ) else (
+            podman pull %IMAGE_REF%
+          )
+
           podman image inspect %IMAGE_REF%
         """
       }
@@ -77,10 +116,15 @@ pipeline {
     }
   }
 
-  // No logout step (it caused noisy failures and isn't required)
-  parameters {
-    booleanParam(name: 'DOCKERHUB_LOGIN',
-                 defaultValue: false,
-                 description: 'Enable only if the Docker Hub repo is PRIVATE or pulls are rate-limited. Requires valid Jenkins credential "dockerhub-creds" (use a Docker Hub access token).')
+  post {
+    always {
+      // Remove the temporary authfile if it exists
+      powershell '''
+        $authFile = Join-Path $env:WORKSPACE ".podman-auth.json"
+        if (Test-Path $authFile) {
+          Remove-Item -Force $authFile
+        }
+      '''
+    }
   }
 }
