@@ -2,14 +2,11 @@ pipeline {
   agent any
 
   environment {
-    // Image already present in Docker Hub (must exist)
-    DOCKERHUB_USER = "saumy123"          // change if needed
-    IMAGE_REPO     = "basic-java-hello"  // change if needed
-    IMAGE_TAG      = "latest"            // or a fixed tag like "1"
+    DOCKERHUB_USER = "saumy123"
+    IMAGE_REPO     = "basic-java-hello"
+    IMAGE_TAG      = "latest"
+    IMAGE_REF      = "docker.io/${DOCKERHUB_USER}/${IMAGE_REPO}:${IMAGE_TAG}"
 
-    IMAGE_REF = "docker.io/${DOCKERHUB_USER}/${IMAGE_REPO}:${IMAGE_TAG}"
-
-    // Podman remote (same as your setup)
     PODMAN_HOST     = "ssh://root@127.0.0.1:64000/run/podman/podman.sock"
     PODMAN_IDENTITY = "C:\\Users\\saumyver\\.local\\share\\containers\\podman\\machine\\machine"
   }
@@ -28,7 +25,9 @@ pipeline {
       }
     }
 
-    stage('Login to Docker Hub') {
+    // Only keep this stage if your Docker Hub repo is PRIVATE
+    stage('Login to Docker Hub (if needed)') {
+      when { expression { return true } } // set to false if image is public
       steps {
         withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
                                           usernameVariable: 'DH_USER',
@@ -47,9 +46,7 @@ pipeline {
         bat """
           set CONTAINER_HOST=%PODMAN_HOST%
           set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
-          echo Pulling %IMAGE_REF%
           podman pull %IMAGE_REF%
-          podman images | findstr /I %IMAGE_REPO% || echo (Pulled image not found in list)
         """
       }
     }
@@ -60,21 +57,9 @@ pipeline {
           $ErrorActionPreference = "Stop"
           $env:CONTAINER_HOST   = $env:PODMAN_HOST
           $env:CONTAINER_SSHKEY = $env:PODMAN_IDENTITY
-
-          # Run the container; HelloWorld prints and exits
           podman run --rm $env:IMAGE_REF | Out-Host
         '''
       }
     }
   }
-
-  post {
-  always {
-    bat """
-      set CONTAINER_HOST=%PODMAN_HOST%
-      set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
-      podman logout docker.io || echo Not logged into docker.io
-    """
-  }
-}
 }
