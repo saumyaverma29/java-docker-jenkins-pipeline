@@ -33,19 +33,23 @@ pipeline {
       is made OPTIONAL and controlled by a boolean parameter.
     */
     stage('Login to Docker Hub (optional)') {
-      when { expression { return params.DOCKERHUB_LOGIN } }
-      steps {
-        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
-                                          usernameVariable: 'DH_USER',
-                                          passwordVariable: 'DH_PASS')]) {
-          bat """
-            set CONTAINER_HOST=%PODMAN_HOST%
-            set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
-            echo %DH_PASS% | podman login docker.io -u %DH_USER% --password-stdin
-          """
-        }
-      }
+  when { expression { return params.DOCKERHUB_LOGIN } }
+  steps {
+    withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                      usernameVariable: 'DH_USER',
+                                      passwordVariable: 'DH_PASS')]) {
+      powershell '''
+        $ErrorActionPreference = "Stop"
+
+        $env:CONTAINER_HOST   = $env:PODMAN_HOST
+        $env:CONTAINER_SSHKEY = $env:PODMAN_IDENTITY
+
+        # Send password/token via stdin safely
+        $env:DH_PASS | podman login docker.io -u $env:DH_USER --password-stdin
+      '''
     }
+  }
+}
 
     stage('Pull image') {
       steps {
