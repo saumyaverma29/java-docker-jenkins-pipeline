@@ -69,13 +69,12 @@ pipeline {
   }
 
   post {
-    always {
-      // Optional: logout/cleanup
-      bat """
-        set CONTAINER_HOST=%PODMAN_HOST%
-        set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
-        podman logout docker.io || exit /b 0
-      """
-    }
+  always {
+    bat """
+      set CONTAINER_HOST=%PODMAN_HOST%
+      set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
+      podman logout docker.io || echo Not logged into docker.io
+    """
   }
+}
 }
