@@ -1,51 +1,49 @@
 pipeline {
   agent any
 
+  // Use Jenkins-managed tools so SYSTEM can run mvn
   tools {
-    jdk 'jdk25'
+    // Change these names to match: Manage Jenkins -> Tools
+    jdk   'jdk25'
     maven 'M3911'
   }
 
   parameters {
-    booleanParam(
-      name: 'DOCKERHUB_LOGIN',
-      defaultValue: true,
-      description: 'Enable if Docker Hub repo is private or you hit rate limits. Uses Docker Hub access token from Jenkins credentials.'
-    )
-    string(name: 'K8S_NAMESPACE',  defaultValue: 'default')
-    string(name: 'K8S_DEPLOYMENT', defaultValue: 'basic-java-hello')
-    string(name: 'K8S_CONTAINER',  defaultValue: 'basic-java-hello')
+    string(name: 'K8S_NAMESPACE',  defaultValue: 'default',          description: 'Kubernetes namespace')
+    string(name: 'K8S_DEPLOYMENT', defaultValue: 'basic-java-hello', description: 'Kubernetes Deployment name')
+    string(name: 'K8S_CONTAINER',  defaultValue: 'basic-java-hello', description: 'Container name in the Deployment')
+    booleanParam(name: 'SKIP_K8S_DEPLOY', defaultValue: false, description: 'Skip kubernetes deploy stage')
   }
 
   environment {
-    DOCKERHUB_USER = "saumy123"
-    IMAGE_REPO     = "basic-java-hello"
+    // ---------- Image settings ----------
+    DOCKERHUB_USER = 'saumy123'
+    IMAGE_REPO     = 'basic-java-hello'
     IMAGE_TAG      = "${BUILD_NUMBER}"
     IMAGE_REF      = "docker.io/${DOCKERHUB_USER}/${IMAGE_REPO}:${IMAGE_TAG}"
 
-    PODMAN_HOST     = "ssh://root@127.0.0.1:64000/run/podman/podman.sock"
-    PODMAN_IDENTITY = "C:\\Users\\saumyver\\.local\\share\\containers\\podman\\machine\\machine"
+    // ---------- Podman remote (Windows -> WSL podman machine) ----------
+    PODMAN_HOST     = 'ssh://root@127.0.0.1:64000/run/podman/podman.sock'
+    PODMAN_IDENTITY = 'C:\\Users\\saumyver\\.local\\share\\containers\\podman\\machine\\machine'
 
-    DOCKERHUB_CREDS_ID = "dockerhub-creds-token"
+    // Jenkins credential: Username = DockerHub user, Password = DockerHub access token
+    DOCKERHUB_CREDS_ID = 'dockerhub-creds-token'
   }
 
   options { timestamps() }
 
   stages {
-    stage('Podman precheck') {
+
+    stage('Precheck: Podman + K8s') {
       steps {
         bat """
+          echo === Podman precheck ===
           set CONTAINER_HOST=%PODMAN_HOST%
           set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
           podman version
-          podman info
-        """
-      }
-    }
+          podman machine list
 
-    stage('K8s precheck (Rancher Desktop)') {
-      steps {
-        bat """
+          echo === Kubectl precheck ===
           where kubectl
           kubectl config current-context
           kubectl get nodes
@@ -55,24 +53,35 @@ pipeline {
 
     stage('Build JAR') {
       steps {
-        bat "mvn -v"
-        bat "mvn -B -DskipTests clean package"
-        bat "dir target"
+        bat """
+          mvn -v
+          mvn -B -DskipTests clean package
+          dir target
+        """
       }
     }
 
-    stage('Login to Docker Hub (optional, using authfile)') {
-      when { expression { return params.DOCKERHUB_LOGIN } }
+    stage('Login to Docker Hub (authfile)') {
       steps {
         withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}",
                                           usernameVariable: 'DH_USER',
-                                          passwordVariable: 'DH_PASS')]) {
+                                          passwordVariable: 'DH_TOKEN')]) {
           powershell '''
             $ErrorActionPreference = "Stop"
+
+            # Ensure podman remote env is set for this step
             $env:CONTAINER_HOST   = $env:PODMAN_HOST
             $env:CONTAINER_SSHKEY = $env:PODMAN_IDENTITY
+
             $authFile = Join-Path $env:WORKSPACE ".podman-auth.json"
-            $env:DH_PASS | podman login docker.io -u $env:DH_USER --password-stdin --authfile $authFile
+
+            if ([string]::IsNullOrWhiteSpace($env:DH_USER))  { throw "Docker Hub username is empty in Jenkins credentials." }
+            if ([string]::IsNullOrWhiteSpace($env:DH_TOKEN)) { throw "Docker Hub token is empty in Jenkins credentials." }
+
+            # Login writes auth into the dedicated file (avoids SYSTEM/user store issues)
+            $env:DH_TOKEN | podman login docker.io -u $env:DH_USER --password-stdin --authfile $authFile
+
+            if (!(Test-Path $authFile)) { throw "Auth file was not created: $authFile" }
           '''
         }
       }
@@ -83,8 +92,11 @@ pipeline {
         bat """
           set CONTAINER_HOST=%PODMAN_HOST%
           set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
+
+          echo Building image: %IMAGE_REF%
           podman build -t %IMAGE_REF% .
-          podman image inspect %IMAGE_REF%
+
+          podman images --format "table {{.Repository}}:{{.Tag}}  {{.ID}}  {{.Size}}"
         """
       }
     }
@@ -94,23 +106,32 @@ pipeline {
         bat """
           set CONTAINER_HOST=%PODMAN_HOST%
           set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
-          if "${params.DOCKERHUB_LOGIN}"=="true" (
-            podman push --authfile "%WORKSPACE%\\.podman-auth.json" %IMAGE_REF%
-          ) else (
-            podman push %IMAGE_REF%
-          )
+
+          echo Pushing image: %IMAGE_REF%
+          podman push --authfile "%WORKSPACE%\\.podman-auth.json" %IMAGE_REF%
         """
       }
     }
 
-    stage('Deploy to Kubernetes') {
+    stage('Deploy to Kubernetes (Rancher Desktop)') {
+      when { expression { return !params.SKIP_K8S_DEPLOY } }
       steps {
         bat """
+          echo Applying manifests (if repo has k8s\\ folder)...
           if exist k8s\\ (
             kubectl -n ${params.K8S_NAMESPACE} apply -f k8s\\
+          ) else (
+            echo No k8s\\ folder found; skipping kubectl apply.
           )
+
+          echo Updating deployment image...
           kubectl -n ${params.K8S_NAMESPACE} set image deployment/${params.K8S_DEPLOYMENT} ${params.K8S_CONTAINER}=%IMAGE_REF%
+
+          echo Waiting for rollout...
           kubectl -n ${params.K8S_NAMESPACE} rollout status deployment/${params.K8S_DEPLOYMENT} --timeout=180s
+
+          echo Pods:
+          kubectl -n ${params.K8S_NAMESPACE} get pods -o wide
         """
       }
     }
@@ -118,6 +139,7 @@ pipeline {
 
   post {
     always {
+      // Clean up authfile (contains registry auth)
       powershell '''
         $authFile = Join-Path $env:WORKSPACE ".podman-auth.json"
         if (Test-Path $authFile) { Remove-Item -Force $authFile }
