@@ -1,18 +1,31 @@
 pipeline {
   agent any
 
-  // Use Jenkins-managed tools so SYSTEM can run mvn
   tools {
-    // Change these names to match: Manage Jenkins -> Tools
-    jdk   'jdk25'
-    maven 'M3911'
+    // Update to match: Manage Jenkins -> Tools
+    jdk   'JDK17'
+    maven 'Maven_3.9.13'
   }
 
   parameters {
+    booleanParam(
+      name: 'DOCKERHUB_LOGIN',
+      defaultValue: false,
+      description: 'Enable ONLY if required (private repo / rate limits / no cached login). Uses Docker Hub access token from Jenkins credentials.'
+    )
+    booleanParam(
+      name: 'SKIP_PUSH',
+      defaultValue: false,
+      description: 'Skip pushing image to Docker Hub (for local-only testing)'
+    )
+    booleanParam(
+      name: 'SKIP_K8S_DEPLOY',
+      defaultValue: false,
+      description: 'Skip Kubernetes deploy stage'
+    )
     string(name: 'K8S_NAMESPACE',  defaultValue: 'default',          description: 'Kubernetes namespace')
     string(name: 'K8S_DEPLOYMENT', defaultValue: 'basic-java-hello', description: 'Kubernetes Deployment name')
     string(name: 'K8S_CONTAINER',  defaultValue: 'basic-java-hello', description: 'Container name in the Deployment')
-    booleanParam(name: 'SKIP_K8S_DEPLOY', defaultValue: false, description: 'Skip kubernetes deploy stage')
   }
 
   environment {
@@ -21,6 +34,9 @@ pipeline {
     IMAGE_REPO     = 'basic-java-hello'
     IMAGE_TAG      = "${BUILD_NUMBER}"
     IMAGE_REF      = "docker.io/${DOCKERHUB_USER}/${IMAGE_REPO}:${IMAGE_TAG}"
+
+    // Local smoke test container name
+    LOCAL_CONTAINER_NAME = "smoke-${BUILD_NUMBER}"
 
     // ---------- Podman remote (Windows -> WSL podman machine) ----------
     PODMAN_HOST     = 'ssh://root@127.0.0.1:64000/run/podman/podman.sock'
@@ -61,33 +77,7 @@ pipeline {
       }
     }
 
-    stage('Login to Docker Hub (authfile)') {
-      steps {
-        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}",
-                                          usernameVariable: 'DH_USER',
-                                          passwordVariable: 'DH_TOKEN')]) {
-          powershell '''
-            $ErrorActionPreference = "Stop"
-
-            # Ensure podman remote env is set for this step
-            $env:CONTAINER_HOST   = $env:PODMAN_HOST
-            $env:CONTAINER_SSHKEY = $env:PODMAN_IDENTITY
-
-            $authFile = Join-Path $env:WORKSPACE ".podman-auth.json"
-
-            if ([string]::IsNullOrWhiteSpace($env:DH_USER))  { throw "Docker Hub username is empty in Jenkins credentials." }
-            if ([string]::IsNullOrWhiteSpace($env:DH_TOKEN)) { throw "Docker Hub token is empty in Jenkins credentials." }
-
-            # Login writes auth into the dedicated file (avoids SYSTEM/user store issues)
-            $env:DH_TOKEN | podman login docker.io -u $env:DH_USER --password-stdin --authfile $authFile
-
-            if (!(Test-Path $authFile)) { throw "Auth file was not created: $authFile" }
-          '''
-        }
-      }
-    }
-
-    stage('Build Image (Podman)') {
+    stage('Build Image (local in Podman machine)') {
       steps {
         bat """
           set CONTAINER_HOST=%PODMAN_HOST%
@@ -96,25 +86,81 @@ pipeline {
           echo Building image: %IMAGE_REF%
           podman build -t %IMAGE_REF% .
 
+          echo Built images:
           podman images --format "table {{.Repository}}:{{.Tag}}  {{.ID}}  {{.Size}}"
         """
       }
     }
 
+    stage('Smoke test (local image, no Docker Hub pull)') {
+      steps {
+        bat """
+          set CONTAINER_HOST=%PODMAN_HOST%
+          set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
+
+          echo Running smoke test using local image: %IMAGE_REF%
+          podman rm -f %LOCAL_CONTAINER_NAME% 2>nul
+
+          REM For a "prints and exits" app:
+          podman run --name %LOCAL_CONTAINER_NAME% --rm %IMAGE_REF%
+        """
+      }
+    }
+
+    stage('Login to Docker Hub (optional)') {
+      when {
+        allOf {
+          expression { return params.DOCKERHUB_LOGIN }
+          expression { return !params.SKIP_PUSH }
+        }
+      }
+      steps {
+        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS_ID}",
+                                          usernameVariable: 'DH_USER',
+                                          passwordVariable: 'DH_TOKEN')]) {
+          powershell '''
+            $ErrorActionPreference = "Stop"
+            $env:CONTAINER_HOST   = $env:PODMAN_HOST
+            $env:CONTAINER_SSHKEY = $env:PODMAN_IDENTITY
+
+            $authFile = Join-Path $env:WORKSPACE ".podman-auth.json"
+
+            if ([string]::IsNullOrWhiteSpace($env:DH_USER))  { throw "Docker Hub username is empty in Jenkins credentials." }
+            if ([string]::IsNullOrWhiteSpace($env:DH_TOKEN)) { throw "Docker Hub token is empty in Jenkins credentials." }
+
+            $env:DH_TOKEN | podman login docker.io -u $env:DH_USER --password-stdin --authfile $authFile
+            if (!(Test-Path $authFile)) { throw "Auth file was not created: $authFile" }
+          '''
+        }
+      }
+    }
+
     stage('Push Image (Docker Hub)') {
+      when { expression { return !params.SKIP_PUSH } }
       steps {
         bat """
           set CONTAINER_HOST=%PODMAN_HOST%
           set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
 
           echo Pushing image: %IMAGE_REF%
-          podman push --authfile "%WORKSPACE%\\.podman-auth.json" %IMAGE_REF%
+
+          if "${params.DOCKERHUB_LOGIN}"=="true" (
+            podman push --authfile "%WORKSPACE%\\.podman-auth.json" %IMAGE_REF%
+          ) else (
+            REM Push without explicit login (will work only if podman already has valid cached auth)
+            podman push %IMAGE_REF%
+          )
         """
       }
     }
 
     stage('Deploy to Kubernetes (Rancher Desktop)') {
-      when { expression { return !params.SKIP_K8S_DEPLOY } }
+      when {
+        allOf {
+          expression { return !params.SKIP_K8S_DEPLOY }
+          expression { return !params.SKIP_PUSH } // since K8s will pull by IMAGE_REF, it must exist in registry
+        }
+      }
       steps {
         bat """
           echo Applying manifests (if repo has k8s\\ folder)...
@@ -124,7 +170,7 @@ pipeline {
             echo No k8s\\ folder found; skipping kubectl apply.
           )
 
-          echo Updating deployment image...
+          echo Updating deployment image to: %IMAGE_REF%
           kubectl -n ${params.K8S_NAMESPACE} set image deployment/${params.K8S_DEPLOYMENT} ${params.K8S_CONTAINER}=%IMAGE_REF%
 
           echo Waiting for rollout...
@@ -139,11 +185,18 @@ pipeline {
 
   post {
     always {
-      // Clean up authfile (contains registry auth)
+      // Clean up authfile (contains registry auth) if it exists
       powershell '''
         $authFile = Join-Path $env:WORKSPACE ".podman-auth.json"
         if (Test-Path $authFile) { Remove-Item -Force $authFile }
       '''
+
+      // Best-effort cleanup of any leftover container (in case you change smoke test to -d)
+      bat(returnStatus: true, script: """
+        set CONTAINER_HOST=%PODMAN_HOST%
+        set CONTAINER_SSHKEY=%PODMAN_IDENTITY%
+        podman rm -f %LOCAL_CONTAINER_NAME% 2>nul
+      """)
     }
   }
 }
