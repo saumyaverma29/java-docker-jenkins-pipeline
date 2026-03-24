@@ -3,8 +3,8 @@ pipeline {
 
   tools {
     // Update to match: Manage Jenkins -> Tools
-    jdk   'JDK17'
-    maven 'Maven_3.9.13'
+    jdk   'jdk25'
+    maven 'M3911'
   }
 
   parameters {
